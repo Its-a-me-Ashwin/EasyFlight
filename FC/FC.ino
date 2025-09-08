@@ -1,12 +1,13 @@
 // Nano RP2040 Connect (Arduino Mbed core)
-// Core 0 (USB): prints at 10 Hz
-// Core 1 (UART): reads iBUS frames, publishes to shared state
+// Core 0 (USB): iBUS → PID → Servos
+// Core 1 (IMU): runs IMU updates and writes to shared state
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Servo.h>
 #include "IMU6DOF.h"
+#include "IBus.h"
 #include "PID.h"
-
 
 // ==== UART pin mapping per core ====
 #if defined(ARDUINO_ARCH_RP2040)        // Earle Philhower core
@@ -15,242 +16,340 @@
   #define USE_PHILHOWER 0               // Arduino Mbed core
 #endif
 
-// Choose pins + note for wiring
 #if USE_PHILHOWER
-  // iBUS RX on D5, TX on D4 (move your wire to D5)
-  static constexpr int UART_TX_PIN = D4;
-  static constexpr int UART_RX_PIN = D5;
-  #define WIRING_NOTE "Philhower: iBUS -> D5 (RX)"
+  static constexpr int UART_TX_PIN = D4;   // not used
+  static constexpr int UART_RX_PIN = D5;   // iBUS signal wire
 #else
-  // Mbed core: Serial1 fixed to D0/D1 (move your wire to D0)
-  // setRX/setTX are not used; pins are fixed by the core
   static constexpr int UART_TX_PIN = -1;
   static constexpr int UART_RX_PIN = -1;
-  #define WIRING_NOTE "Mbed: iBUS -> D0 (RX)"
 #endif
 
-// ======== Config ========
-#define NUM_CH            6
-#define PRINT_PERIOD_MS   100   // 10 Hz
-#define IBUS_BAUD         115200
-// ========================
+#define NUM_CH     6
+#define IBUS_BAUD  115200
+#define PRINT_PERIOD_MS 100
+
+// Servo Pins
+#define SERVO_1_PIN  D6
+#define SERVO_2_PIN  D7
+#define SERVO_3_PIN  D8
+#define SERVO_4_PIN  D9
+
+// Servo endpoint
+#define SERVO_MIN 1000
+#define SERVO_MAX 2000
+
+// Normalization Scales
+#define ROLL_NORM  45  // deg
+#define PITCH_NORM 45  // deg
+#define YAW_NORM   10  // deg/s
+
+// Failsafe values
+const uint16_t FAILSAFE_DEFAULTS[NUM_CH] = {
+  1500, // Roll → center
+  1500, // Pitch → center
+  SERVO_MIN, // Throttle → idle
+  1500, // Yaw → center
+  SERVO_MIN, // Aux1
+  SERVO_MIN  // Aux2
+};
+
 
 // ======== Shared State & Seqlock ========
 struct SharedState {
-  // Seqlock (must be first two members)
-  volatile uint32_t seq;           // increments before/after write (odd=in progress)
+  volatile uint32_t seq;
   volatile uint32_t last_update_ms;
 
-  // App data (extend as needed)
-  uint16_t channels[NUM_CH];       // CH1..CH6
-  uint32_t frame_count;            // valid frames seen
-  uint32_t bad_checksum;           // checksum failures
-  uint32_t lost_sync;              // header sync issues
-
   float imu_roll, imu_pitch, imu_yaw;
+  float imu_roll_rate, imu_pitch_rate, imu_yaw_rate;
 };
 
-// Global shared data
-SharedState g_state;
+struct DesiredState {
+  float roll_angle;
+  float pitch_angle;
+  float yaw_rate;
+};
 
-// Seqlock helpers
+struct ControlOutputs {
+  float roll;
+  float pitch;
+  float yaw;
+};
+
+SharedState g_state;
+static uint32_t last_iBus_ms = 0;
+
+// seqlock helpers
 static inline void seqlock_write_begin(volatile uint32_t &seq) {
-  seq++; // make odd
+  seq++;
   __atomic_thread_fence(__ATOMIC_ACQ_REL);
 }
 static inline void seqlock_write_end(volatile uint32_t &seq) {
   __atomic_thread_fence(__ATOMIC_ACQ_REL);
-  seq++; // make even
+  seq++;
 }
 
-// Snapshot read (returns true if consistent copy obtained)
 template<typename T>
 bool seqlock_read_consistent(const T &src, T &dst) {
-  // We assume seq and last_update_ms are first/volatile in struct
   const volatile uint32_t *pseq = &src.seq;
   while (true) {
     uint32_t before = *pseq;
-    if (before & 1u) { continue; } // writer in progress
+    if (before & 1u) continue;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-
-    // Copy the struct byte-wise to avoid tearing on non-volatile fields
     memcpy(&dst, &src, sizeof(T));
-
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     uint32_t after = src.seq;
     if (before == after && !(after & 1u)) return true;
   }
 }
 
-// ---------- Non-blocking iBUS parser (state machine) ----------
-class IBusDecoder {
-public:
-  explicit IBusDecoder(HardwareSerial &uart, uint8_t num_ch = NUM_CH)
-  : _uart(uart), _num_ch(num_ch > NUM_CH ? NUM_CH : num_ch) { reset(); }
-
-  void begin(uint32_t baud = IBUS_BAUD) { _uart.begin(baud); }
-
-  // Returns true when a full, valid frame decoded into out_ch
-  bool poll(uint16_t *out_ch, uint32_t &bad_checksum, uint32_t &lost_sync) {
-    while (_uart.available()) {
-      uint8_t b = _uart.read();
-      switch (_state) {
-        case 0: // expect 0x20 (length)
-          if (b == 0x20) { _sum = b; _idx = 0; _state = 1; }
-          else { lost_sync++; }
-          break;
-        case 1: // expect 0x40 (type)
-          if (b == 0x40) { _sum += b; _state = 2; }
-          else { lost_sync++; _state = 0; }
-          break;
-        case 2: // read 28 payload bytes
-          _buf[_idx++] = b; _sum += b;
-          if (_idx >= 28) { _state = 3; _idx = 0; }
-          break;
-        case 3: // checksum LSB
-          _chkL = b; _state = 4; break;
-        case 4: { // checksum MSB
-          uint16_t chk_calc = (uint16_t)(0xFFFF - (_sum & 0xFFFF)); // ← fixed
-          uint16_t chk_recv = (uint16_t)_chkL | ((uint16_t)b << 8);
-          if (chk_calc == chk_recv) {
-            for (int i = 0; i < _num_ch; ++i) {
-              int o = i * 2;
-              out_ch[i] = (uint16_t)_buf[o] | ((uint16_t)_buf[o + 1] << 8);
-            }
-            reset();
-            return true;
-          } else {
-            bad_checksum++;
-            reset();
-          }
-        } break;
-      }
-    }
-    return false;
-  }
-
-  void reset() { _state = 0; _idx = 0; _sum = 0; _chkL = 0; }
-
-private:
-  HardwareSerial &_uart;
-  uint8_t  _num_ch;
-
-  uint8_t  _state = 0;
-  uint8_t  _buf[28];
-  uint8_t  _idx = 0;
-  uint32_t _sum = 0;
-  uint8_t  _chkL = 0;
-};
-
-
-// ======== Core 1 (iBUS + IMU) ========
-IBusDecoder ibus(Serial1);
+// ======== Core 1 (IMU) ========
 IMU6DOF imu;
 
 void setup1() {
   Wire.begin();
   Wire.setClock(400000);
-  
-  // Serial1.setRX(D5);   // iBUS signal wire goes to D5
-  // Serial1.setTX(D4);   // TX not used by iBUS, but must be set
-  // Serial1.setTimeout(2);
-  // Serial1.begin(115200);   // iBUS is 115200 8N1
+  while (!imu.init()) { delay(50); }
+  imu.setLoopFrequency(500);
+  memset((void*)&g_state, 0, sizeof(g_state));
+}
+
+// ======== Core 1 (IMU) ========
+void loop1() {
+  static uint32_t last_loop_us = micros();
+
+  imu.update();
+
+  seqlock_write_begin(g_state.seq);
+  g_state.imu_roll       = imu.getRoll();
+  g_state.imu_pitch      = imu.getPitch();
+  g_state.imu_yaw        = imu.getYaw();
+  g_state.imu_roll_rate  = imu.getRollRate();
+  g_state.imu_pitch_rate = imu.getPitchRate();
+  g_state.imu_yaw_rate   = imu.getYawRate();
+  g_state.last_update_ms = millis();
+  seqlock_write_end(g_state.seq);
+
+  // maintain ~500 Hz loop timing
+  const uint32_t target_period_us = 2000; // 2 ms = 500 Hz
+  uint32_t now_us = micros();
+  uint32_t elapsed = now_us - last_loop_us;
+  if (elapsed < target_period_us) {
+    delayMicroseconds(target_period_us - elapsed);
+  }
+  last_loop_us = micros();
+}
+
+
+
+// ======== Core 0 (USB + iBUS + PID + Servos) ========
+IBusDecoder ibus(Serial1);
+DesiredState desired;
+ControlOutputs control;
+
+// Servos
+Servo servo1, servo2, servo3, servo4;
+
+// PID controllers
+PID pidRoll(0.8f, 0.4f, 0.02f);
+PID pidPitch(0.8f, 0.4f, 0.02f);
+PID pidYaw(0.8f, 0.4f, 0.02f);
+
+template <typename T1, typename T2>
+float fmap(T1 x, T2 in_min, T2 in_max, float out_min, float out_max) {
+  return (float)(x - in_min) * (out_max - out_min) / (float)(in_max - in_min) + out_min;
+}
+
+void normalizeDesiredState(uint16_t *iBusData, DesiredState &st) {
+  st.roll_angle  = fmap(iBusData[0], 1000, 2000, -ROLL_NORM, ROLL_NORM);
+  st.pitch_angle = fmap(iBusData[1], 1000, 2000, -PITCH_NORM, PITCH_NORM);
+  st.yaw_rate    = fmap(iBusData[3], 1000, 2000, -YAW_NORM, YAW_NORM);
+}
+
+void calculateOutputs(const DesiredState &desired, ControlOutputs &out,
+                      float roll_angle, float pitch_angle,
+                      float yaw_rate, float dt) {
+  out.roll  = pidRoll.compute(desired.roll_angle,  roll_angle,  dt);
+  out.pitch = pidPitch.compute(desired.pitch_angle, pitch_angle, dt);
+  out.yaw   = pidYaw.compute(desired.yaw_rate, yaw_rate, dt);
+}
+
+void writeCommands(const ControlOutputs &out, uint16_t throttleRaw) {
+  // Simple fixed-wing mixer
+  int ail = constrain(map(out.roll,  -1.0f, 1.0f, SERVO_MIN, SERVO_MAX), SERVO_MIN, SERVO_MAX);
+  int ele = constrain(map(out.pitch, -1.0f, 1.0f, SERVO_MIN, SERVO_MAX), SERVO_MIN, SERVO_MAX);
+  int rud = constrain(map(out.yaw,   -1.0f, 1.0f, SERVO_MIN, SERVO_MAX), SERVO_MIN, SERVO_MAX);
+  int thr = constrain(throttleRaw, SERVO_MIN, SERVO_MAX);
+
+  servo1.writeMicroseconds(ail); // aileron
+  servo2.writeMicroseconds(ele); // elevator
+  servo3.writeMicroseconds(thr); // throttle
+  servo4.writeMicroseconds(rud); // rudder
+}
+
+void applyFailsafe(uint16_t *channels, bool got_frame) {
+  if (got_frame) {
+    last_iBus_ms = millis();  // refresh on valid frame
+    return;
+  }
+
+  // If no valid frame for >100 ms → apply failsafe defaults
+  if (millis() - last_iBus_ms > 100) {
+    for (int i = 0; i < NUM_CH; i++) {
+      channels[i] = FAILSAFE_DEFAULTS[i];
+    }
+  }
+}
+
+
+void sendTelemetryFrame(const uint16_t *channels,
+                        const SharedState &snap,
+                        const ControlOutputs &control,
+                        uint32_t bad, uint32_t lost) {
+  const uint8_t START_BYTE = 0xAA;
+
+  // Prepare buffer
+  uint8_t buf[128];
+  int idx = 0;
+
+  buf[idx++] = START_BYTE;  // start
+  buf[idx++] = 0;           // placeholder for length
+
+  auto put16 = [&](uint16_t v) {
+    buf[idx++] = v & 0xFF;
+    buf[idx++] = (v >> 8) & 0xFF;
+  };
+
+  auto put32f = [&](float f) {
+    uint8_t *p = (uint8_t*)&f;
+    for (int i = 0; i < 4; i++) buf[idx++] = p[i];
+  };
+
+  // Channels
+  for (int i = 0; i < NUM_CH; i++) put16(channels[i]);
+
+  // IMU
+  put32f(snap.imu_roll);
+  put32f(snap.imu_pitch);
+  put32f(snap.imu_yaw);
+
+  // Rates
+  put32f(snap.imu_roll_rate);
+  put32f(snap.imu_pitch_rate);
+  put32f(snap.imu_yaw_rate);
+
+  // PID outputs
+  put32f(control.roll);
+  put32f(control.pitch);
+  put32f(control.yaw);
+
+  // Bad/lost
+  put16((uint16_t)bad);
+  put16((uint16_t)lost);
+
+  // Fill length
+  buf[1] = idx - 2; // exclude start + length field
+
+  // Compute checksum (XOR of payload only)
+  uint8_t checksum = 0;
+  for (int i = 2; i < idx; i++) {
+    checksum ^= buf[i];
+  }
+  buf[idx++] = checksum;
+
+  // Send frame
+  Serial.write(buf, idx);
+}
+
+void printTelemetry(const uint16_t *channels,
+                    const SharedState &snap,
+                    const ControlOutputs &control,
+                    uint32_t bad,
+                    uint32_t lost) {
+  Serial.print("CH: ");
+  for (int i = 0; i < NUM_CH; i++) {
+    Serial.print(channels[i]);
+    if (i < NUM_CH - 1) Serial.print(' ');
+  }
+
+  Serial.print(" | R: ");
+  Serial.print(snap.imu_roll, 2);
+  Serial.print(" P: ");
+  Serial.print(snap.imu_pitch, 2);
+  Serial.print(" Y: ");
+  Serial.print(snap.imu_yaw, 2);
+
+  Serial.print(" | Rates R: ");
+  Serial.print(snap.imu_roll_rate, 2);
+  Serial.print(" P: ");
+  Serial.print(snap.imu_pitch_rate, 2);
+  Serial.print(" Y: ");
+  Serial.print(snap.imu_yaw_rate, 2);
+
+  Serial.print(" | RollOut: ");
+  Serial.print(control.roll, 2);
+  Serial.print(" PitchOut: ");
+  Serial.print(control.pitch, 2);
+  Serial.print(" YawOut: ");
+  Serial.print(control.yaw, 2);
+
+  Serial.print(" | bad: ");
+  Serial.print(bad);
+  Serial.print(" | lost: ");
+  Serial.println(lost);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("Core0: iBUS + IMU + PID");
 
 #if USE_PHILHOWER
   Serial1.setRX(UART_RX_PIN);
   Serial1.setTX(UART_TX_PIN);
 #endif
-  Serial1.setTimeout(10);
-  Serial1.begin(115200);   // iBUS 115200 8N1
-
+  Serial1.setTimeout(0);
   ibus.begin(IBUS_BAUD);
-  while (!imu.init())
-  {
-    delay(50);
-  }
-  imu.setLoopFrequency(500);
 
-  // Initialize shared state
-  memset((void*)&g_state, 0, sizeof(g_state));
-  g_state.last_update_ms = millis();
-  for (int i = 0; i < NUM_CH; ++i) g_state.channels[i] = 1500; // neutral
-  g_state.imu_pitch = 0;
-  g_state.imu_roll = 0;
-  g_state.imu_yaw = 0;
-  
-}
-
-void loop1() {
-  uint16_t ch_local[NUM_CH];
-  uint32_t bad = g_state.bad_checksum;
-  uint32_t lost = g_state.lost_sync;
-
-  if (ibus.poll(ch_local, bad, lost)) {
-    seqlock_write_begin(g_state.seq);
-    for (int i = 0; i < NUM_CH; ++i) g_state.channels[i] = ch_local[i];
-    g_state.last_update_ms = millis();
-    g_state.frame_count++;
-    g_state.bad_checksum = bad;
-    g_state.lost_sync = lost;
-    seqlock_write_end(g_state.seq);
-  }
-
-  imu.update();
-  float r = imu.getRoll(), p = imu.getPitch(), y = imu.getYaw();
-  
-  seqlock_write_begin(g_state.seq);
-  g_state.imu_roll = r;
-  g_state.imu_pitch = p;
-  g_state.imu_yaw = y;
-  seqlock_write_end(g_state.seq);
-
-}
-
-
-//// PID declarations
-PID pidRoll(0.8f, 0.4f, 0.02f); 
-PID pidPitch(0.8f, 0.4f, 0.02f);
-PID pidYaw(0.8f, 0.4f, 0.02f);
-
-
-// ======== Core 0 (USB @ 10 Hz and PID LOOPS for RPY) ========
-void setup() {
-  Serial.begin(115200);
-  delay(300);
-  Serial.println("Dual-core iBUS (6ch) with seqlock + extensible SharedState @10Hz");
+  servo1.attach(SERVO_1_PIN, SERVO_MIN, SERVO_MAX);
+  servo2.attach(SERVO_2_PIN, SERVO_MIN, SERVO_MAX);
+  servo3.attach(SERVO_3_PIN, SERVO_MIN, SERVO_MAX);
+  servo4.attach(SERVO_4_PIN, SERVO_MIN, SERVO_MAX);
 }
 
 void loop() {
   static uint32_t last_print = 0;
+  static uint32_t bad = 0, lost = 0;
+  static uint32_t last_time = millis();
+
+  uint16_t channels[NUM_CH];
+  SharedState snap;
+
+  bool got_frame = ibus.poll(channels, bad, lost);
+  applyFailsafe(channels, got_frame);
+
+  if (!seqlock_read_consistent(g_state, snap)) return;
+
   uint32_t now = millis();
-  if (now - last_print >= PRINT_PERIOD_MS) {
+  float dt = (now - last_time) / 1000.0f;
+  last_time = now;
+
+  // Normalize desired state
+  normalizeDesiredState(channels, desired);
+
+  // PID outputs
+  calculateOutputs(desired, control,
+                   snap.imu_roll,
+                   snap.imu_pitch,
+                   snap.imu_yaw_rate,   // 🔹 use gyro Z
+                   dt);
+
+  // Mix + write to servos
+  writeCommands(control, channels[2]);
+
+  // Telementry print
+  if (now - last_print >= PRINT_PERIOD_MS || got_frame) {
     last_print = now;
-
-    // Get a consistent snapshot for printing
-    SharedState snap;
-    if (seqlock_read_consistent(g_state, snap)) {
-      uint32_t age = now - snap.last_update_ms;
-
-      Serial.print("CH: ");
-      for (int i = 0; i < NUM_CH; ++i) {
-        Serial.print(snap.channels[i]);
-        if (i < NUM_CH - 1) Serial.print(' ');
-      }
-      Serial.print("R: ");
-      Serial.print(snap.imu_roll);
-      Serial.print("P: ");
-      Serial.print(snap.imu_pitch);
-      Serial.print("Y: ");
-      Serial.print(snap.imu_yaw);
-      Serial.print(" | age: ");
-      Serial.print(age);
-      Serial.print(" ms");
-      Serial.print(" | frames: ");
-      Serial.print(snap.frame_count);
-      Serial.print(" | bad: ");
-      Serial.print(snap.bad_checksum);
-      Serial.print(" | lost: ");
-      Serial.println(snap.lost_sync);
-    }
+    sendTelemetryFrame(channels, snap, control, bad, lost);
+    //printTelemetry(channels, snap, control, bad, lost); // Used for serial based debug
   }
 }

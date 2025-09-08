@@ -23,6 +23,10 @@ class IMU6DOF {
     float getPitch();
     float getYaw();
 
+    float getRollRate();   // GyroX
+    float getPitchRate();  // GyroY
+    float getYawRate();    // GyroZ
+
   private:
     // Filter constants
     float B_madgwick = 0.04f;

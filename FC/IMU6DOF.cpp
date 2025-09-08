@@ -147,3 +147,15 @@ inline float IMU6DOF::invSqrt(float x) { return 1.0f / sqrtf(x); }
 float IMU6DOF::getRoll()  { return roll; }
 float IMU6DOF::getPitch() { return pitch; }
 float IMU6DOF::getYaw()   { return yaw; }
+
+float IMU6DOF::getRollRate() {
+  return GyroX;
+}
+
+float IMU6DOF::getPitchRate() {
+  return GyroY;
+}
+
+float IMU6DOF::getYawRate() {
+  return GyroZ;
+}
