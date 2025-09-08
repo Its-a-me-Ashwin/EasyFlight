@@ -1,4 +1,4 @@
-# EasyFlight ✈️  
+# EasyFlight 
 A compact and configurable **flight controller** for RC planes and drones, featuring dual-core processing, real-time telemetry, and a GUI for debugging and tuning.  
 
 ---
